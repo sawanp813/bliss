@@ -46,6 +46,7 @@ class TileCatalog(UserDict):
         self.n_sources = d.pop("n_sources")
         self.batch_size, self.n_tiles_h, self.n_tiles_w, self.max_sources = self.locs.shape[:-1]
         super().__init__(**d)
+        # allows for optional parameters to be accessed (allowed_parms)
 
     def __setitem__(self, key: str, item: Tensor) -> None:
         if key not in self.allowed_params:
@@ -106,18 +107,31 @@ class TileCatalog(UserDict):
         plocs = self._get_full_locs_from_tiles()
         param_names_to_mask = {"plocs"}.union(set(self.keys()))
         tile_params_to_gather = {"plocs": plocs}
-        tile_params_to_gather.update(self)
+        tile_params_to_gather.update(self)  # updates with keys from original tile catalog
 
         params = {}
+
+        # retrieves mask for 'on' light sources
+        # is_on_array ~ truncates all param tensors to only retain information up to the
+        # maximum number of sources sampled in the image
+        # indices_to_retrieve ~ indices corresponding to 'on' light sources according to
+        # sample (i.e. its tile sampled a 1 from the distribution for n_sources, giving
+        # it a light source)
         indices_to_retrieve, is_on_array = self._get_indices_of_on_sources()
+
+        #  MAP TO ZERO HERE
+        #  ---------
         for param_name, tile_param in tile_params_to_gather.items():
             k = tile_param.shape[-1]
+            # rearrange to be 32 x TILE_AREA x (1 or 2)
             param = rearrange(tile_param, "b nth ntw s k -> b (nth ntw s) k", k=k)
+            # same as indices_to_retrieve but repeats index (i.e. results in 32x11x2)
             indices_for_param = repeat(indices_to_retrieve, "b nth_ntw_s -> b nth_ntw_s k", k=k)
             param = torch.gather(param, dim=1, index=indices_for_param)
             if param_name in param_names_to_mask:
                 param = param * is_on_array.unsqueeze(-1)
             params[param_name] = param
+        #  ---------
 
         params["n_sources"] = reduce(self.n_sources, "b nth ntw -> b", "sum")
         height, width = self.n_tiles_h * self.tile_slen, self.n_tiles_w * self.tile_slen
@@ -139,7 +153,9 @@ class TileCatalog(UserDict):
         tile_coords = torch.cartesian_prod(x_coords, y_coords)
 
         # recenter and renormalize locations.
+        # concatenates all light source locations for a batch
         locs = rearrange(self.locs, "b nth ntw d xy -> (b nth ntw) d xy", xy=2)
+        # 2048x1x2, 64 tile coordinates*32 images/batch (i.e. 2048 tiles/batch)
         bias = repeat(tile_coords, "n xy -> (r n) 1 xy", r=self.batch_size).float()
 
         plocs = locs * self.tile_slen + bias
@@ -406,6 +422,7 @@ def get_is_on_from_n_sources(n_sources, max_sources):
     )
 
     for i in range(max_sources):
+        # adds all tiles containing at least i light sources
         is_on_array[..., i] = n_sources > i
 
     return is_on_array

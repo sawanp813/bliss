@@ -14,7 +14,7 @@ from torch.optim.lr_scheduler import MultiStepLR
 from yolov5.models.yolo import DetectionModel
 
 from bliss.catalog import TileCatalog
-from bliss.metrics import DetectionMetrics
+from bliss.metrics import BlissMetrics
 from bliss.plotting import plot_detections
 from bliss.unconstrained_dists import (
     UnconstrainedBernoulli,
@@ -69,11 +69,11 @@ class Encoder(pl.LightningModule):
         # a hack to get the right number of outputs from yolo
         architecture["nc"] = self.n_params_per_source - 5
         arch_dict = OmegaConf.to_container(architecture)
-        self.model = DetectionModel(cfg=arch_dict, ch=2)
+        self.model = DetectionModel(cfg=arch_dict, ch=2)  # yolov5
         self.tiles_to_crop = tiles_to_crop
 
         # metrics
-        self.metrics = DetectionMetrics(slack)
+        self.metrics = BlissMetrics(slack)  # set to combined metrics class once created
 
     @property
     def dist_param_groups(self):
@@ -103,18 +103,25 @@ class Encoder(pl.LightningModule):
         assert images_with_background.size(3) % 16 == 0, "image dims must be multiples of 16"
         output = self.model(images_with_background)
         # there's an extra dimension for channel that is always a singleton
+        # contains parameters for each distribution corresponding to each random variable
         output4d = rearrange(output[0], "b 1 ht wt pps -> b ht wt pps")
 
         ttc = self.tiles_to_crop
         if ttc > 0:
+            # crop tile-corresponding dimensions
             output4d = output4d[:, ttc:-ttc, ttc:-ttc, :]
 
+        # 11 distributions, retrieves the number of parameters needed for each distribition
         split_sizes = [v.dim for v in self.dist_param_groups.values()]
+        # splits output tensor into split_sizes
         dist_params_split = torch.split(output4d, split_sizes, 3)
         names = self.dist_param_groups.keys()
+        # [on_prob, loc, star_log_flux, galaxy_prob, galsim_flux, galsim_disk_frac,
+        # galsim_beta_radians, galsim_disk_q, galsim_a_d, galsim_bulge_q, galsim_a_b]
         pred = dict(zip(names, dist_params_split))
 
         for k, v in pred.items():
+            # distance matrix for each parameter for each tile in batch
             pred[k] = self.dist_param_groups[k].get_dist(v)
 
         return pred
@@ -122,6 +129,8 @@ class Encoder(pl.LightningModule):
     def variational_mode(self, pred: Dict[str, Tensor]) -> Dict[str, Tensor]:
         """Compute the mode of the variational distribution."""
         # the mean would be better at minimizing squared error...should we return that instead?
+
+        # mode of each tile for each image - determines whether tile is 'on
         tile_is_on_array = pred["on_prob"].mode
         # this is the mode of star_log_flux but not the mean of the star_flux distribution
         star_fluxes = pred["star_log_flux"].mode.exp()  # type: ignore
@@ -206,14 +215,17 @@ class Encoder(pl.LightningModule):
 
         return loss_with_components
 
+    # TODO: Set plot_images to True only when testing plots
     def _generic_step(self, batch, logging_name, log_metrics=False, plot_images=False):
         batch_size = batch["images"].size(0)
-        pred = self.encode_batch(batch)
+        pred = self.encode_batch(batch)  # returns distribution for each random variable
+
+        # HERE -- check if estimated light sources are mapped to (0, 0)
         true_tile_cat = TileCatalog(self.tile_slen, batch["tile_catalog"])
         true_tile_cat = true_tile_cat.symmetric_crop(self.tiles_to_crop)
         loss_dict = self._get_loss(pred, true_tile_cat)
         true_full_cat = true_tile_cat.to_full_params()
-        est_cat = self.variational_mode(pred)
+        est_cat = self.variational_mode(pred)  # sampled values from each distribution
 
         # log all losses
         for k, v in loss_dict.items():
@@ -229,9 +241,11 @@ class Encoder(pl.LightningModule):
         if plot_images:
             batch_size = len(batch["images"])
             n_samples = min(int(math.sqrt(batch_size)) ** 2, 16)
-            nrows = int(n_samples**0.5)  # for figure
+            nrows = int(n_samples**0.5)  # for figure, 4
+            # takes all images where (# estim sources) != (# true sources)
             wrong_idx = (est_cat.n_sources != true_full_cat.n_sources).nonzero()
-            wrong_idx = wrong_idx.view(-1)[:n_samples]
+            wrong_idx = wrong_idx.view(-1)[:n_samples]  # flatten
+            # defines pixel margin to crop
             margin_px = self.tiles_to_crop * self.tile_slen
             fig = plot_detections(
                 batch["images"], true_full_cat, est_cat, nrows, wrong_idx, margin_px
@@ -239,6 +253,7 @@ class Encoder(pl.LightningModule):
             title_root = f"Epoch:{self.current_epoch}/"
             title = f"{title_root}{logging_name} images"
             if self.logger:
+                # already adds figure to tensorboard
                 self.logger.experiment.add_figure(title, fig)
             plt.close(fig)
 

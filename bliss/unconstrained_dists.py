@@ -37,7 +37,7 @@ class UnconstrainedDiagonalBivariateNormal:
         self.dim = 4
 
     def get_dist(self, params):
-        mean = params[:, :, :, :2]
+        mean = params[:, :, :, :2].sigmoid()
         sd = params[:, :, :, 2:].clamp(-6, 3).exp().sqrt()
         base_dist = Normal(mean, sd)
         return Independent(base_dist, 1)
